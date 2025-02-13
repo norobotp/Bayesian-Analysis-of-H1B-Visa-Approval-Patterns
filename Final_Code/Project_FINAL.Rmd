@@ -1,0 +1,1203 @@
+---
+title: "DATASCI451 Project"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r}
+# Required packages
+library(tidyverse)
+library(rstan)
+library(bayesplot)
+library(ggplot2)
+library(dplyr)
+library(brms)
+library(tidybayes)
+
+```
+
+```{r}
+# Load H1B data
+h1b_data <- read.csv("H1B_data.csv")
+
+# Check data structure
+str(h1b_data)
+summary(h1b_data)
+
+```
+
+```{r}
+# Create volume categories
+sampled_data_cate <- h1b_data %>%
+  mutate(
+    volume_category = cut(
+      Total_Applications,
+      breaks = c(-Inf, 10, 30, 100, Inf),
+      labels = c("1-10", "11-30", "31-100", "100+"),
+      right = TRUE
+    )
+  )
+
+# Calculate approval rates (average of individual rates)
+volume_summary <- sampled_data_cate %>%
+  group_by(volume_category) %>%
+  summarise(
+    Initial_Approval_Rate = mean(Initial_Approval_Rate, na.rm = TRUE),
+    Continuing_Approval_Rate = mean(Continuing_Approval_Rate, na.rm = TRUE),
+    Initial_Count = sum(Total_Initial, na.rm = TRUE),    # Modified part
+    Continuing_Count = sum(Total_Continuing, na.rm = TRUE)    # Modified part
+  )
+
+# Transform data format
+volume_summary_long <- volume_summary %>%
+  pivot_longer(
+    cols = c(Initial_Approval_Rate, Continuing_Approval_Rate),
+    names_to = "Application_Type",
+    values_to = "Approval_Rate"
+  ) %>%
+  mutate(
+    Application_Type = recode(
+      Application_Type,
+      "Initial_Approval_Rate" = "Initial",
+      "Continuing_Approval_Rate" = "Continuing"
+    ),
+    Count = ifelse(Application_Type == "Initial", Initial_Count, Continuing_Count)
+  )
+
+# Visualization
+ggplot(volume_summary_long, 
+       aes(x = volume_category, y = Approval_Rate, fill = Application_Type)) +
+  geom_bar(stat = "identity", 
+           position = position_dodge(width = 0.7), 
+           width = 0.6) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = c("Initial" = "skyblue", "Continuing" = "lightgreen")) +
+  labs(
+    title = "Approval Rates by Volume Category",
+    x = "Application Volume Category",
+    y = "Approval Rate",
+    fill = "Application Type"
+  ) +
+  theme_minimal() +
+  theme(
+    text = element_text(size = 12),
+    legend.position = "bottom",
+    panel.grid.major.y = element_line(color = "gray90"),
+    panel.grid.minor.y = element_line(color = "gray95")
+  )
+```
+
+
+
+```{r}
+
+# Calculate approval rates by Industry (NAICS Code)
+industry_summary <- sampled_data_cate %>%
+  group_by(`Industry..NAICS..Code`, volume_category) %>%
+  summarise(
+    Initial_Approval_Rate = mean(Initial_Approval_Rate, na.rm = TRUE), 
+    Continuing_Approval_Rate = mean(Continuing_Approval_Rate, na.rm = TRUE), 
+    Initial_Count = sum(Total_Initial, na.rm = TRUE), 
+    Continuing_Count = sum(Total_Continuing, na.rm = TRUE),  
+    .groups = 'drop' 
+  )
+
+# Transform data format (long format)
+industry_summary_long <- industry_summary %>%
+  pivot_longer(
+    cols = c(Initial_Approval_Rate, Continuing_Approval_Rate),
+    names_to = "Application_Type",
+    values_to = "Approval_Rate"
+  ) %>%
+  mutate(
+    Application_Type = recode(
+      Application_Type,
+      "Initial_Approval_Rate" = "Initial",
+      "Continuing_Approval_Rate" = "Continuing"
+    )
+  )
+
+# Visualization of approval rates by industry
+ggplot(industry_summary_long, aes(x = reorder(`Industry..NAICS..Code`, -Approval_Rate), y = Approval_Rate, fill = Application_Type)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.7), width = 0.6) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Approval Rates by Industry and Volume Category",
+    x = "Industry",
+    y = "Approval Rate",
+    fill = "Application Type"
+  ) +
+  facet_wrap(~volume_category, scales = "free_x") +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1),
+    legend.position = "bottom",
+    panel.grid.major.y = element_line(color = "gray90"),
+    panel.grid.minor.y = element_line(color = "gray95")
+  )
+
+```
+
+
+
+```{r}
+# Data Sampling - Reducing sample size
+set.seed(123)
+sampled_data <- h1b_data %>%
+  group_by(Employer..Petitioner..Name) %>%
+  summarise(
+    total_applications = sum(Total_Applications),
+    initial_total = sum(Total_Initial),
+    initial_approvals = sum(Initial.Approval),
+    continuing_total = sum(Total_Continuing),
+    continuing_approvals = sum(Continuing.Approval),
+    industry = first(Industry..NAICS..Code),
+    state = first(Petitioner.State),
+    .groups = 'drop'
+  ) %>%
+  filter(total_applications > 0) %>%
+  sample_n(min(2000, n())) %>%  # 3000 -> 2000
+  mutate(
+    volume_category = case_when(
+      total_applications <= 10 ~ 1,
+      total_applications <= 30 ~ 2,
+      total_applications <= 100 ~ 3,
+      TRUE ~ 4
+    )
+  )
+
+# Stan Code - Apply Non-centered Parameterization
+stan_code <- "
+data {
+  int<lower=0> N;              
+  int<lower=0> N_vol;          
+  int<lower=0> N_ind;          
+  int<lower=0> N_state;        
+  
+  int<lower=1,upper=N_vol> vol[N];     
+  int<lower=1,upper=N_ind> ind[N];     
+  int<lower=1,upper=N_state> state[N]; 
+  
+  int<lower=0> initial_total[N];
+  int<lower=0> initial_success[N];
+  int<lower=0> continuing_total[N];
+  int<lower=0> continuing_success[N];
+}
+
+parameters {
+  // Initial applications - raw parameters
+  vector[N_vol] vol_effect_init_raw;
+  vector[N_ind] ind_effect_init_raw[N_vol];
+  vector[N_state] state_effect_init_raw[N_vol];
+  real<lower=0> sigma_vol_init;
+  real<lower=0> sigma_ind_init;
+  real<lower=0> sigma_state_init;
+  
+  // Continuing applications - raw parameters
+  vector[N_vol] vol_effect_cont_raw;
+  vector[N_ind] ind_effect_cont_raw[N_vol];
+  vector[N_state] state_effect_cont_raw[N_vol];
+  real<lower=0> sigma_vol_cont;
+  real<lower=0> sigma_ind_cont;
+  real<lower=0> sigma_state_cont;
+}
+
+transformed parameters {
+  // Initial applications - transformed parameters
+  vector[N_vol] vol_effect_init;
+  matrix[N_vol, N_ind] ind_effect_init;
+  matrix[N_vol, N_state] state_effect_init;
+  
+  // Continuing applications - transformed parameters
+  vector[N_vol] vol_effect_cont;
+  matrix[N_vol, N_ind] ind_effect_cont;
+  matrix[N_vol, N_state] state_effect_cont;
+  
+  // Transform initial application parameters
+  vol_effect_init = sigma_vol_init * vol_effect_init_raw;
+  
+  for (v in 1:N_vol) {
+    for (i in 1:N_ind) {
+      ind_effect_init[v,i] = sigma_ind_init * ind_effect_init_raw[v][i];
+    }
+    for (s in 1:N_state) {
+      state_effect_init[v,s] = sigma_state_init * state_effect_init_raw[v][s];
+    }
+  }
+  
+  // Transform continuing application parameters
+  vol_effect_cont = sigma_vol_cont * vol_effect_cont_raw;
+  
+  for (v in 1:N_vol) {
+    for (i in 1:N_ind) {
+      ind_effect_cont[v,i] = sigma_ind_cont * ind_effect_cont_raw[v][i];
+    }
+    for (s in 1:N_state) {
+      state_effect_cont[v,s] = sigma_state_cont * state_effect_cont_raw[v][s];
+    }
+  }
+}
+
+model {
+  // Standard normal priors for raw parameters - initial
+  vol_effect_init_raw ~ std_normal();
+  for (v in 1:N_vol) {
+    ind_effect_init_raw[v] ~ std_normal();
+    state_effect_init_raw[v] ~ std_normal();
+  }
+  
+  // Standard normal priors for raw parameters - continuing
+  vol_effect_cont_raw ~ std_normal();
+  for (v in 1:N_vol) {
+    ind_effect_cont_raw[v] ~ std_normal();
+    state_effect_cont_raw[v] ~ std_normal();
+  }
+  
+  // Half-normal priors for scale parameters
+  sigma_vol_init ~ normal(0, 1);
+  sigma_ind_init ~ normal(0, 1);
+  sigma_state_init ~ normal(0, 1);
+  
+  sigma_vol_cont ~ normal(0, 1);
+  sigma_ind_cont ~ normal(0, 1);
+  sigma_state_cont ~ normal(0, 1);
+  
+  // Likelihood
+  for (n in 1:N) {
+    real logit_p_init = vol_effect_init[vol[n]] + 
+                       ind_effect_init[vol[n], ind[n]] +
+                       state_effect_init[vol[n], state[n]];
+                       
+    real logit_p_cont = vol_effect_cont[vol[n]] + 
+                       ind_effect_cont[vol[n], ind[n]] +
+                       state_effect_cont[vol[n], state[n]];
+                   
+    if (initial_total[n] > 0)
+      initial_success[n] ~ binomial_logit(initial_total[n], logit_p_init);
+      
+    if (continuing_total[n] > 0)
+      continuing_success[n] ~ binomial_logit(continuing_total[n], logit_p_cont);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik; 
+  
+  for (n in 1:N) {
+    real logit_p_init = vol_effect_init[vol[n]] + 
+                        ind_effect_init[vol[n], ind[n]] + 
+                        state_effect_init[vol[n], state[n]];
+    
+    real logit_p_cont = vol_effect_cont[vol[n]] + 
+                        ind_effect_cont[vol[n], ind[n]] + 
+                        state_effect_cont[vol[n], state[n]];
+                        
+    log_lik[n] = binomial_logit_lpmf(initial_success[n] | initial_total[n], logit_p_init) +
+                 binomial_logit_lpmf(continuing_success[n] | continuing_total[n], logit_p_cont);
+  }
+}
+
+"
+# Convert data to Stan-compatible format
+stan_data <- list(
+  N = nrow(sampled_data),
+  N_vol = max(sampled_data$volume_category),
+  N_ind = length(unique(sampled_data$industry)),
+  N_state = length(unique(sampled_data$state)),
+  vol = sampled_data$volume_category,
+  ind = as.integer(factor(sampled_data$industry)),
+  state = as.integer(factor(sampled_data$state)),
+  initial_total = sampled_data$initial_total,
+  initial_success = sampled_data$initial_approvals,
+  continuing_total = sampled_data$continuing_total,
+  continuing_success = sampled_data$continuing_approvals
+)
+
+# Set CPU cores
+options(mc.cores = parallel::detectCores())
+rstan_options(auto_write = TRUE)
+
+# Run Stan model
+fit <- stan(
+ model_code = stan_code,
+  data = stan_data, 
+  chains = 4,
+  iter = 15000,     
+  warmup = 7500,    
+  thin = 3,         
+  control = list(
+    adapt_delta = 0.99999,
+    max_treedepth = 20,
+    stepsize = 0.001
+  )
+)
+
+```
+
+```{r}
+
+str(sampled_data)
+```
+
+
+```{r}
+# For Stan models, we'll need to manually generate predictions from posterior samples
+# First, let's extract the posterior samples
+posterior <- extract(fit)
+
+# Function to generate predictions from posterior samples
+generate_predictions <- function(posterior, n_pred = 100) {
+  # Get dimensions
+  n_samples <- dim(posterior$vol_effect_init)[1]
+  n_vol <- dim(posterior$vol_effect_init)[2]
+  
+  # Randomly select samples for prediction
+  sample_indices <- sample(1:n_samples, n_pred)
+  
+  # Generate predictions for each volume category
+  predictions <- matrix(nrow = n_pred, ncol = nrow(sampled_data))
+  
+  for(i in 1:n_pred) {
+    idx <- sample_indices[i]
+    for(j in 1:nrow(sampled_data)) {
+      # Get volume category
+      vol <- sampled_data$volume_category[j]
+      ind <- as.numeric(factor(sampled_data$industry))[j]
+      state <- as.numeric(factor(sampled_data$state))[j]
+      
+      # Calculate logit probability
+      logit_p <- posterior$vol_effect_init[idx,vol] +
+                 posterior$ind_effect_init[idx,vol,ind] +
+                 posterior$state_effect_init[idx,vol,state]
+      
+      # Convert to probability
+      predictions[i,j] <- plogis(logit_p)
+    }
+  }
+  
+  return(predictions)
+}
+
+# Generate predictions
+y_rep <- generate_predictions(posterior, n_pred = 100)
+
+# Calculate observed rates
+observed_rates <- with(sampled_data, 
+                      ifelse(initial_total > 0, 
+                            initial_approvals / initial_total, 
+                            NA))
+
+# Now we can use bayesplot functions
+ppc_dens_overlay(
+  y = observed_rates[!is.na(observed_rates)],
+  yrep = y_rep[,!is.na(observed_rates)]
+) +
+  labs(title = "Posterior Predictive Check",
+       subtitle = "Density Overlay of Observed vs. Predicted Approval Rates")
+
+# Test statistics comparison
+ppc_stat(
+  y = observed_rates[!is.na(observed_rates)],
+  yrep = y_rep[,!is.na(observed_rates)],
+  stat = "mean"
+) +
+  labs(title = "Posterior Predictive Check",
+       subtitle = "Distribution of Mean Approval Rate")
+
+# Additional diagnostics
+# Volume category comparison
+ppc_intervals_grouped(
+  y = observed_rates[!is.na(observed_rates)],
+  yrep = y_rep[,!is.na(observed_rates)],
+  group = sampled_data$volume_category[!is.na(observed_rates)],
+  facet_args = list(ncol = 1)
+) +
+  labs(title = "Posterior Predictive Check by Volume Category",
+       subtitle = "Intervals of Predicted vs. Observed Rates")
+```
+
+
+
+```{r}
+calculate_residuals <- function(fit, data) {
+  # Extract Posterior 
+  posterior <- extract(fit)
+  
+  vol_idx <- data$volume_category
+  ind_idx <- as.numeric(factor(data$industry))
+  state_idx <- as.numeric(factor(data$state))
+  
+  # Number of posterior samples and data points
+  n_samples <- dim(posterior$vol_effect_init)[1]
+  n_data <- nrow(data)
+  
+  
+  logit_p <- matrix(0, nrow = n_samples, ncol = n_data)
+  
+  # Calculate logit_p 
+  for (i in 1:n_samples) {
+    for (j in 1:n_data) {
+      logit_p[i, j] <- posterior$vol_effect_init[i, vol_idx[j]] +
+                       posterior$ind_effect_init[i, vol_idx[j], ind_idx[j]] +
+                       posterior$state_effect_init[i, vol_idx[j], state_idx[j]]
+    }
+  }
+  
+  # Convert logits to probabilities
+  predictions <- plogis(logit_p)
+  
+  # Calculate observed approval rates
+  observed_rates <- ifelse(data$initial_total > 0, data$initial_approvals / data$initial_total, NA)
+  
+  # Calculate mean predictions
+  mean_predictions <- colMeans(predictions)
+  
+  # Compute Residuals 
+  residuals <- observed_rates - mean_predictions
+  
+  return(data.frame(
+    residuals = residuals,
+    volume_category = data$volume_category,
+    observed = observed_rates,
+    predicted = mean_predictions
+  ))
+}
+
+
+residuals_df <- calculate_residuals(fit, sampled_data)
+
+# Visualize the distribution of residuals
+ggplot(residuals_df, aes(x = residuals)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~volume_category) +
+  labs(title = "Residual Distribution by Volume Category",
+       x = "Residuals",
+       y = "Count") +
+  theme_minimal()
+
+```
+```{r}
+# Q-Q plot
+ggplot(residuals_df, aes(sample = residuals)) +
+  stat_qq() + 
+  stat_qq_line() +
+  labs(title = "Normal Q-Q Plot of Residuals") +
+  theme_minimal()
+
+# Additional diagnostic plots
+# Residuals vs Predicted
+ggplot(residuals_df, aes(x = predicted, y = residuals)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  facet_wrap(~volume_category) +
+  labs(title = "Residuals vs Predicted Values",
+       x = "Predicted Approval Rate",
+       y = "Residuals") +
+  theme_minimal()
+
+# Box plot of residuals by volume category
+ggplot(residuals_df, aes(x = factor(volume_category), y = residuals)) +
+  geom_boxplot() +
+  labs(title = "Residuals by Volume Category",
+       x = "Volume Category",
+       y = "Residuals") +
+  theme_minimal()
+```
+
+
+
+
+
+
+```{r}
+traceplot(fit, pars = c("sigma_vol_init", "sigma_ind_init", "sigma_state_init"))
+
+```
+
+
+```{r}
+# Compute ESS and R-hat
+ess_rhat <- summary(fit)$summary[, c("n_eff", "Rhat")]
+parameters <- rownames(summary(fit)$summary)
+
+# Calculate ESS Ratio
+iterations <- fit@sim$iter
+ess_ratio <- ess_rhat[, "n_eff"] / iterations
+
+# Create a data frame for visualization
+diagnostics <- data.frame(
+  Parameter = parameters,
+  ESS_Ratio = ess_ratio,
+  Rhat = ess_rhat[, "Rhat"]
+)
+
+# Plot ESS Ratio
+ess_ratio_plot <- ggplot(diagnostics, aes(x = ESS_Ratio, y = Parameter)) +
+  geom_point(color = "blue") +
+  geom_vline(xintercept = 0.1, linetype = "dashed", color = "red") + # 기준선
+  labs(
+    title = "Effective Sample Size Ratios",
+    x = "ESS Ratio (n_eff / n_iter)",
+    y = "Parameter"
+  ) +
+  theme_minimal()
+
+# Plot R-hat values
+rhat_plot <- ggplot(diagnostics, aes(x = Rhat, y = Parameter)) +
+  geom_point(color = "red") +
+  geom_vline(xintercept = 1.1, linetype = "dashed", color = "red") + # 기준선
+  labs(
+    title = "R-hat Values",
+    x = "R-hat",
+    y = "Parameter"
+  ) +
+  theme_minimal()
+
+
+grid.arrange(ess_ratio_plot, rhat_plot, ncol = 2)
+```
+
+
+
+```{r}
+# Extract volume effects from the Stan model
+vol_effect_init <- rstan::extract(fit, "vol_effect_init")[[1]]
+vol_effect_cont <- rstan::extract(fit, "vol_effect_cont")[[1]]
+
+# Check dimensions
+print("Dimensions:")
+print(dim(vol_effect_init))  # [iterations, volume_categories]
+print(dim(vol_effect_cont))
+
+# Calculate mean effects for each volume category
+volume_effects <- data.frame(
+    Category = factor(rep(c("1-10", "11-30", "31-100", "100+"), 2), 
+                     levels = c("1-10", "11-30", "31-100", "100+")),
+    Type = rep(c("Initial", "Continuing"), each = 4)
+)
+
+volume_effects$Effect <- c(
+    apply(plogis(vol_effect_init), 2, mean), 
+    apply(plogis(vol_effect_cont), 2, mean)
+)
+
+# Calculate mean effects and confidence intervals
+volume_effects$Lower <- c(
+    apply(plogis(vol_effect_init), 2, quantile, 0.025),
+    apply(plogis(vol_effect_cont), 2, quantile, 0.025)
+)
+
+volume_effects$Upper <- c(
+    apply(plogis(vol_effect_init), 2, quantile, 0.975),
+    apply(plogis(vol_effect_cont), 2, quantile, 0.975)
+)
+
+
+get_effects <- function(param_name) {
+  param_samples <- rstan::extract(fit, param_name)[[1]]
+  if (is.null(param_samples)) {
+    return(NULL)
+  }
+  
+  n_samples <- dim(param_samples)[1]
+  n_vol <- dim(param_samples)[2]
+  n_units <- dim(param_samples)[3]
+  
+  effects <- array(NA, dim = c(n_vol, n_units, 3))
+  
+  for(v in 1:n_vol) {
+    for(i in 1:n_units) {
+      samples <- param_samples[,v,i]
+      effects[v,i,1] <- mean(plogis(samples))
+      effects[v,i,2] <- quantile(plogis(samples), 0.025)
+      effects[v,i,3] <- quantile(plogis(samples), 0.975)
+    }
+  }
+  
+  return(effects)
+}
+
+# Calculate industrial effect
+ind_effects_init <- get_effects("ind_effect_init")
+ind_effects_cont <- get_effects("ind_effect_cont")
+
+if (!is.null(ind_effects_init) && !is.null(ind_effects_cont)) {
+  n_ind <- dim(ind_effects_init)[2]
+  industry_effects <- data.frame(
+    Volume = rep(rep(factor(c("1-10", "11-30", "31-100", "100+")), each = n_ind), 2),
+    Type = rep(c("Initial", "Continuing"), each = n_ind * 4),
+    Industry = rep(1:n_ind, 8),
+    Effect = c(c(ind_effects_init[,,1]), c(ind_effects_cont[,,1])),
+    Lower = c(c(ind_effects_init[,,2]), c(ind_effects_cont[,,2])),
+    Upper = c(c(ind_effects_init[,,3]), c(ind_effects_cont[,,3]))
+  )
+}
+
+# Calculate State effect
+get_state_effects <- function(param_name) {
+  param_samples <- rstan::extract(fit, param_name)[[1]]
+  if (is.null(param_samples)) {
+    return(NULL)
+  }
+  
+  n_samples <- dim(param_samples)[1]
+  n_vol <- dim(param_samples)[2]
+  n_states <- dim(param_samples)[3]
+  
+  effects <- array(NA, dim = c(n_vol, n_states, 3))
+  
+  for(v in 1:n_vol) {
+    for(s in 1:n_states) {
+      samples <- param_samples[,v,s]
+      effects[v,s,1] <- mean(plogis(samples))
+      effects[v,s,2] <- quantile(plogis(samples), 0.025)
+      effects[v,s,3] <- quantile(plogis(samples), 0.975)
+    }
+  }
+  
+  return(effects)
+}
+
+state_effects_init <- get_state_effects("state_effect_init")
+state_effects_cont <- get_state_effects("state_effect_cont")
+
+
+print("State effects dimensions:")
+print("state_effects_init dimensions:")
+print(dim(state_effects_init))
+print("state_effects_cont dimensions:")
+print(dim(state_effects_cont))
+print("Number of unique states:")
+print(length(unique(sampled_data$state)))
+
+
+# Create state_effects_df with adjusted calculations
+if (!is.null(state_effects_init) && !is.null(state_effects_cont)) {
+  n_states <- dim(state_effects_init)[2] 
+  
+  # Calculate the number of rows
+  n_rows <- n_states * 4 * 2  # Number of states * number of volume categories * type count
+
+  state_effects_df <- data.frame(
+    Volume = factor(rep(rep(c("1-10", "11-30", "31-100", "100+"), each = n_states), 2),
+                   levels = c("1-10", "11-30", "31-100", "100+")),
+    Type = rep(c("Initial", "Continuing"), each = n_states * 4),
+    State = rep(levels(factor(sampled_data$state))[1:n_states], 8)
+  )
+  
+  # Add Effect, Lower, Upper separately
+  state_effects_df$Effect <- c(c(state_effects_init[,,1]), c(state_effects_cont[,,1]))
+  state_effects_df$Lower <- c(c(state_effects_init[,,2]), c(state_effects_cont[,,2]))
+  state_effects_df$Upper <- c(c(state_effects_init[,,3]), c(state_effects_cont[,,3]))
+  
+  # Check dimensions of the data frame
+  print("Dimensions of state_effects_df:")
+  print(dim(state_effects_df))
+}
+# Visualization
+if (exists("volume_effects")) {
+  p1 <- ggplot(volume_effects, aes(x = Category, y = Effect, color = Type)) +
+      geom_point(position = position_dodge(width = 0.3), size = 3) +
+      geom_errorbar(aes(ymin = Lower, ymax = Upper),
+                    position = position_dodge(width = 0.3), width = 0.2) +
+      geom_hline(yintercept = 0.9, linetype = "dashed", color = "red") +
+      theme_minimal() +
+      labs(title = "Volume Category Effects on Approval Rate",
+           subtitle = "Average Individual Effects (Probability Scale)",
+           y = "Probability",
+           x = "Application Volume Category") +
+      scale_y_continuous(limits = c(0.9, 1), labels = scales::percent) +
+      theme(text = element_text(size = 12))
+  
+  print(p1)
+}
+
+if (exists("industry_effects")) {
+  p2 <- ggplot(industry_effects,
+               aes(x = reorder(paste(Industry, Volume, Type), Effect),
+                   y = Effect, color = interaction(Volume, Type))) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.2) +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = "Industry Effects by Volume Category",
+         subtitle = "Initial vs Continuing Applications",
+         y = "Probability", x = "Industry") +
+    scale_y_continuous(labels = scales::percent) +
+    theme(text = element_text(size = 12))
+  
+  print(p2)
+}
+
+if (exists("state_effects_df")) {
+  p3 <- ggplot(state_effects_df,
+               aes(x = reorder(paste(State, Volume, Type), Effect),
+                   y = Effect, color = interaction(Volume, Type))) +
+    geom_point(size = 3) +
+    geom_errorbar(aes(ymin = Lower, ymax = Upper), width = 0.2) +
+    geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+    coord_flip() +
+    theme_minimal() +
+    labs(title = "State Effects by Volume Category",
+         subtitle = "Initial vs Continuing Applications",
+         y = "Probability", x = "State") +
+    scale_y_continuous(labels = scales::percent) +
+    theme(text = element_text(size = 12))
+  
+  print(p3)
+}
+```
+
+```{r}
+# Function to visualize Prior, Likelihood, Posterior distributions
+plot_distributions_comparison <- function(fit, data) {
+  # Extract posterior samples
+  posterior_init <- rstan::extract(fit, "vol_effect_init")[[1]]
+  posterior_cont <- rstan::extract(fit, "vol_effect_cont")[[1]]
+  
+  # Generate Prior samples (standard normal prior used in Stan model)
+  n_samples <- nrow(posterior_init)
+  prior_samples <- rnorm(n_samples * 4)
+  
+  # Approximate Likelihood
+  likelihood_init <- c()
+  likelihood_cont <- c()
+  
+  for(vol in 1:4) {
+    # Filter data by volume category
+    vol_data <- data %>%
+      filter(volume_category == vol)
+    
+    # Calculate initial approval rates
+    init_rates <- with(vol_data, initial_approvals / initial_total)
+    init_rates <- init_rates[!is.na(init_rates) & init_rates > 0 & init_rates < 1]
+    
+    if(length(init_rates) > 0) {
+      likelihood_init <- c(likelihood_init, 
+                         rnorm(n_samples, 
+                              mean = qlogis(mean(init_rates)), 
+                              sd = sd(qlogis(init_rates))))
+    }
+    
+    # Calculate continuing approval rates
+    cont_rates <- with(vol_data, continuing_approvals / continuing_total)
+    cont_rates <- cont_rates[!is.na(cont_rates) & cont_rates > 0 & cont_rates < 1]
+    
+    if(length(cont_rates) > 0) {
+      likelihood_cont <- c(likelihood_cont, 
+                         rnorm(n_samples, 
+                              mean = qlogis(mean(cont_rates)), 
+                              sd = sd(qlogis(cont_rates))))
+    }
+  }
+  
+  # Create data frame
+  df <- data.frame(
+    value = c(plogis(prior_samples),
+              plogis(likelihood_init), plogis(likelihood_cont),
+              plogis(c(posterior_init)), plogis(c(posterior_cont))),
+    type = factor(rep(c("Prior", "Likelihood (Initial)", "Likelihood (Continuing)", 
+                       "Posterior (Initial)", "Posterior (Continuing)"),
+                     c(length(prior_samples),
+                       length(likelihood_init), length(likelihood_cont),
+                       length(c(posterior_init)), length(c(posterior_cont)))),
+                 levels = c("Prior", "Likelihood (Initial)", "Likelihood (Continuing)", 
+                          "Posterior (Initial)", "Posterior (Continuing)")),
+    Distribution = factor(rep(c("Prior", "Likelihood", "Likelihood", "Posterior", "Posterior"),
+                            c(length(prior_samples),
+                              length(likelihood_init), length(likelihood_cont),
+                              length(c(posterior_init)), length(c(posterior_cont)))))
+  )
+  
+  # Visualize distributions using ggplot
+  ggplot(df, aes(x = value, fill = type)) +
+    geom_density(alpha = 0.5) +
+    scale_fill_manual(values = c("Prior" = "grey70",
+                                "Likelihood (Initial)" = "#FFB366",
+                                "Likelihood (Continuing)" = "#B366FF",
+                                "Posterior (Initial)" = "#FF9999",
+                                "Posterior (Continuing)" = "#9999FF")) +
+    facet_wrap(~Distribution, ncol = 1, scales = "free_y") +
+    labs(title = "Prior, Likelihood, and Posterior Distributions",
+         subtitle = "Comparison across Application Types",
+         x = "Approval Rate",
+         y = "Density",
+         fill = "Distribution Type") +
+    theme_minimal() +
+    scale_x_continuous(labels = scales::percent, limits = c(0, 1)) +
+    theme(legend.position = "right",
+          plot.title = element_text(size = 14, face = "bold"),
+          plot.subtitle = element_text(size = 12),
+          axis.text = element_text(size = 10),
+          axis.title = element_text(size = 12),
+          legend.title = element_text(size = 12),
+          legend.text = element_text(size = 10),
+          strip.text = element_text(size = 12, face = "bold"))
+}
+
+# Generate plot
+plot_distributions_comparison(fit, sampled_data)
+```
+
+
+```{r}
+# Select parameters from the model
+posterior_samples <- extract(fit)
+param_names <- names(posterior_samples)
+
+# Select key parameters for visualization
+params_to_plot <- c(
+  "vol_effect_init[1]", "vol_effect_init[2]", 
+  "vol_effect_init[3]", "vol_effect_init[4]",
+  "vol_effect_cont[1]", "vol_effect_cont[2]", 
+  "vol_effect_cont[3]", "vol_effect_cont[4]",
+  "sigma_vol_init", "sigma_vol_cont"
+)
+
+# Create trace plots
+mcmc_trace(as.array(fit), 
+           pars = params_to_plot,
+           facet_args = list(ncol = 2, strip.position = "top"),
+           n_warmup = 0) +  # Exclude warmup period
+  theme_minimal() +
+  labs(title = "Convergence Diagnostics",
+       subtitle = "Trace plots for key parameters") +
+  theme(plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle = element_text(size = 12),
+        strip.text = element_text(size = 10),
+        axis.text = element_text(size = 8),
+        axis.title = element_text(size = 10))
+
+```
+
+
+```{r}
+# 1. Analyze posterior comparisons
+analyze_posterior_comparisons <- function(fit, type = "industry") {
+  # Extract posterior samples
+  posterior <- extract(fit)
+  
+  if(type == "industry") {
+    effects_init <- posterior$ind_effect_init
+    effects_cont <- posterior$ind_effect_cont
+    n_categories <- dim(effects_init)[3]  # Number of industries
+  } else if(type == "state") {
+    effects_init <- posterior$state_effect_init
+    effects_cont <- posterior$state_effect_cont
+    n_categories <- dim(effects_init)[3]  # Number of states
+  }
+  
+  # Number of volume categories
+  n_vol <- dim(effects_init)[2]
+  
+  # Initialize results data frame
+  results <- data.frame()
+  
+  # Compare across volume categories
+  for(v in 1:n_vol) {
+    for(i in 1:(n_categories-1)) {
+      for(j in (i+1):n_categories) {
+        # Initial applications
+        prob_init <- mean(plogis(effects_init[,v,i]) > plogis(effects_init[,v,j]))
+        
+        # Continuing applications
+        prob_cont <- mean(plogis(effects_cont[,v,i]) > plogis(effects_cont[,v,j]))
+        
+        results <- rbind(results, data.frame(
+          volume_category = c("1-10", "11-30", "31-100", "100+")[v],
+          category1 = i,
+          category2 = j,
+          prob_greater_init = prob_init,
+          prob_greater_cont = prob_cont
+        ))
+      }
+    }
+  }
+  
+  return(results)
+}
+
+# 2. Industry comparison analysis
+industry_comparisons <- analyze_posterior_comparisons(fit, type = "industry")
+
+# 3. State comparison analysis
+state_comparisons <- analyze_posterior_comparisons(fit, type = "state")
+
+# 4. Visualizing results
+
+# Identifying industry pairs with the largest differences
+top_industry_differences <- industry_comparisons %>%
+  group_by(volume_category) %>%
+  mutate(
+    diff_from_half = abs(prob_greater_init - 0.5)
+  ) %>%
+  top_n(5, diff_from_half)
+
+ggplot(top_industry_differences, 
+       aes(x = paste(category1, "vs", category2), 
+           y = prob_greater_init)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+  facet_wrap(~volume_category) +
+  coord_flip() +
+  labs(
+    title = "Top Industry Comparisons by Volume Category",
+    subtitle = "Posterior Probability of Higher Approval Rate",
+    x = "Industry Comparison",
+    y = "Probability"
+  ) +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent)
+
+# Visualizing state comparisons in the same way
+top_state_differences <- state_comparisons %>%
+  group_by(volume_category) %>%
+  mutate(
+    diff_from_half = abs(prob_greater_init - 0.5)
+  ) %>%
+  top_n(5, diff_from_half)
+
+ggplot(top_state_differences, 
+       aes(x = paste(category1, "vs", category2), 
+           y = prob_greater_init)) +
+  geom_bar(stat = "identity", fill = "lightgreen") +
+  geom_hline(yintercept = 0.5, linetype = "dashed", color = "red") +
+  facet_wrap(~volume_category) +
+  coord_flip() +
+  labs(
+    title = "Top State Comparisons by Volume Category",
+    subtitle = "Posterior Probability of Higher Approval Rate",
+    x = "State Comparison",
+    y = "Probability"
+  ) +
+  theme_minimal() +
+  scale_y_continuous(labels = scales::percent)
+
+# 5. Statistical summary
+summary_stats <- function(comparisons) {
+  comparisons %>%
+    group_by(volume_category) %>%
+    summarize(
+      mean_prob_init = mean(prob_greater_init),
+      sd_prob_init = sd(prob_greater_init),
+      mean_prob_cont = mean(prob_greater_cont),
+      sd_prob_cont = sd(prob_greater_cont),
+      n_strong_differences = sum(abs(prob_greater_init - 0.5) > 0.25)
+    )
+}
+
+# Summary statistics for industry comparisons
+industry_summary <- summary_stats(industry_comparisons)
+print("Industry Comparison Summary:")
+print(industry_summary)
+
+# Summary statistics for state comparisons
+state_summary <- summary_stats(state_comparisons)
+print("State Comparison Summary:")
+print(state_summary)
+
+# 6. Displaying pairs with the largest differences
+print_top_differences <- function(comparisons, n = 5) {
+  comparisons %>%
+    arrange(desc(abs(prob_greater_init - 0.5))) %>%
+    head(n) %>%
+    mutate(
+      strength = case_when(
+        prob_greater_init > 0.95 ~ "Very Strong",
+        prob_greater_init > 0.75 ~ "Strong",
+        prob_greater_init < 0.05 ~ "Very Strong (Reverse)",
+        prob_greater_init < 0.25 ~ "Strong (Reverse)",
+        TRUE ~ "Moderate"
+      )
+    ) %>%
+    select(volume_category, category1, category2, prob_greater_init, strength)
+}
+
+print("Top Industry Differences:")
+print(print_top_differences(industry_comparisons))
+
+print("Top State Differences:")
+print(print_top_differences(state_comparisons))
+```
+
+
+```{r}
+# Function to extract the top 3 industries by approval rate for each volume category (Initial & Continuous)
+find_top3_industry_by_volume <- function(fit, data) {
+  posterior <- extract(fit)
+  
+  n_vol <- dim(posterior$ind_effect_init)[2]  
+  n_ind <- dim(posterior$ind_effect_init)[3]  
+  industry_names <- levels(factor(data$industry))  
+  
+  results <- data.frame()
+  
+  # Calculate approval rates for each volume category
+  for (v in 1:n_vol) {
+    # Initial Applications
+    avg_approval_init <- apply(posterior$ind_effect_init[, v, ], 2, function(x) mean(plogis(x)))
+    top3_init <- order(avg_approval_init, decreasing = TRUE)[1:3]
+    
+    # Continuous Applications
+    avg_approval_cont <- apply(posterior$ind_effect_cont[, v, ], 2, function(x) mean(plogis(x)))
+    top3_cont <- order(avg_approval_cont, decreasing = TRUE)[1:3]
+    
+    # Save results (Initial)
+    results <- rbind(results,
+                     data.frame(volume_category = v, 
+                                category = "Initial",
+                                industry = industry_names[top3_init], 
+                                mean_approval_rate = avg_approval_init[top3_init]))
+    
+    # Save results (Continuous)
+    results <- rbind(results,
+                     data.frame(volume_category = v, 
+                                category = "Continuous",
+                                industry = industry_names[top3_cont], 
+                                mean_approval_rate = avg_approval_cont[top3_cont]))
+  }
+  
+  return(results)
+}
+
+# Run the function
+top3_industry <- find_top3_industry_by_volume(fit, sampled_data)
+print("Top 3 Industries by Volume Category (Initial & Continuous):")
+print(top3_industry)
+
+ggplot(top3_industry, 
+       aes(x = reorder(industry, mean_approval_rate), y = mean_approval_rate, fill = category)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~volume_category, scales = "free_x") +
+  labs(title = "Top 3 Industries by Volume Category (Initial & Continuous)",
+       x = "Industry",
+       y = "Mean Approval Rate") +
+  theme_minimal() +
+  coord_flip()
+
+```
+
+```{r}
+# Function to extract the top 3 states by approval rate for each volume category (Initial & Continuous)
+find_top3_state_by_volume <- function(fit, data) {
+  posterior <- extract(fit)
+  
+  n_vol <- dim(posterior$state_effect_init)[2]  
+  n_state <- dim(posterior$state_effect_init)[3]  
+  state_names <- levels(factor(data$state)) 
+  
+  results <- data.frame()
+  
+  # Calculate approval rates for each volume category
+  for (v in 1:n_vol) {
+    # Initial Applications
+    avg_approval_init <- apply(posterior$state_effect_init[, v, ], 2, function(x) mean(plogis(x)))
+    top3_init <- order(avg_approval_init, decreasing = TRUE)[1:3]
+    
+    # Continuous Applications
+    avg_approval_cont <- apply(posterior$state_effect_cont[, v, ], 2, function(x) mean(plogis(x)))
+    top3_cont <- order(avg_approval_cont, decreasing = TRUE)[1:3]
+    
+    # Save results (Initial)
+    results <- rbind(results,
+                     data.frame(volume_category = v, 
+                                category = "Initial",
+                                state = state_names[top3_init], 
+                                mean_approval_rate = avg_approval_init[top3_init]))
+    
+    # Save results (Continuous)
+    results <- rbind(results,
+                     data.frame(volume_category = v, 
+                                category = "Continuous",
+                                state = state_names[top3_cont], 
+                                mean_approval_rate = avg_approval_cont[top3_cont]))
+  }
+  
+  return(results)
+}
+
+# Run the function
+top3_state <- find_top3_state_by_volume(fit, sampled_data)
+print("Top 3 States by Volume Category (Initial & Continuous):")
+print(top3_state)
+
+ggplot(top3_state, 
+       aes(x = reorder(state, mean_approval_rate), y = mean_approval_rate, fill = category)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  facet_wrap(~volume_category, scales = "free_x") +
+  labs(title = "Top 3 States by Volume Category (Initial & Continuous)",
+       x = "State",
+       y = "Mean Approval Rate") +
+  theme_minimal() +
+  coord_flip()
+
+```
+
+```{r}
+summarize_posterior_estimates <- function(fit, data, type = "industry") {
+  posterior <- extract(fit)
+  
+  if(type == "industry") {
+    effects_init <- posterior$ind_effect_init
+    effects_cont <- posterior$ind_effect_cont
+    categories <- levels(factor(data$industry))
+  } else if(type == "state") {
+    effects_init <- posterior$state_effect_init
+    effects_cont <- posterior$state_effect_cont
+    categories <- levels(factor(data$state))
+  }
+  
+  n_vol <- dim(effects_init)[2]  # Number of volume categories
+  n_cat <- dim(effects_init)[3]  # Number of categories
+  
+  results <- data.frame()
+  
+  # Calculate posterior summaries for each volume and category
+  for (v in 1:n_vol) {
+    for (c in 1:n_cat) {
+      # Initial
+      init_samples <- plogis(effects_init[, v, c])
+      init_summary <- data.frame(
+        volume_category = v,
+        category = categories[c],
+        type = "Initial",
+        mean = mean(init_samples),
+        sd = sd(init_samples),
+        lci = quantile(init_samples, 0.025),
+        uci = quantile(init_samples, 0.975)
+      )
+      
+      # Continuous
+      cont_samples <- plogis(effects_cont[, v, c])
+      cont_summary <- data.frame(
+        volume_category = v,
+        category = categories[c],
+        type = "Continuous",
+        mean = mean(cont_samples),
+        sd = sd(cont_samples),
+        lci = quantile(cont_samples, 0.025),
+        uci = quantile(cont_samples, 0.975)
+      )
+      
+      results <- rbind(results, init_summary, cont_summary)
+    }
+  }
+  
+  return(results)
+}
+
+# Calculate posterior estimates for industries and states
+industry_estimates <- summarize_posterior_estimates(fit, sampled_data, type = "industry")
+state_estimates <- summarize_posterior_estimates(fit, sampled_data, type = "state")
+
+print("Industry Posterior Estimates:")
+print(industry_estimates)
+
+print("State Posterior Estimates:")
+print(state_estimates)
+
+```
+
+
